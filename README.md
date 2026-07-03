@@ -1,4 +1,26 @@
-# comfi-example
+# comfi-examples-hands
+
+Fork of [Gepetto/comfi-examples](https://github.com/Gepetto/comfi-examples) extended
+with **full-body + MANO hand inverse kinematics via ACADOS MPC**, driven by SAM3D
+Goliath-70 keypoints (offline and live). Companion repo of
+[Fast-SAM-3D-Body](https://github.com/SoulieTechnologies/Fast-SAM-3D-Body).
+
+Added scripts (see their docstrings):
+- `scripts/run_ik_acados_mpc_sam3d.py` / `run_ik_acados_mpc_sam3d_live.py` — SAM3D + MANO IK (ACADOS MPC)
+- `scripts/run_ik_live.py` — live IK from streamed SAM3D 3D (TCP) → meshcat
+- `scripts/run_ik_live_rerun.py` — live IK + Rerun mirroring (pairs with `rerun_demo.py` in Fast-SAM-3D-Body)
+
+Note: `acados/` and the generated solver code are **not** shipped — install/build
+acados on your machine and set `ACADOS_SOURCE_DIR` (see script docstrings).
+
+Vendored hand model (with local modifications):
+[YuyangLee/mano-urdf](https://github.com/YuyangLee/mano-urdf) in `model/mano-urdf/`.
+The Sharpa robot-hand assets (`model/sharpa_hand/`, `human_with_sharpa.urdf`) are
+**not** shipped — get them from
+[sharpa-robotics/sharpa-urdf-usd-xml](https://github.com/sharpa-robotics/sharpa-urdf-usd-xml)
+if you need that variant.
+
+---
 
 Scripts to use and showcase the data from the COMFI dataset
 

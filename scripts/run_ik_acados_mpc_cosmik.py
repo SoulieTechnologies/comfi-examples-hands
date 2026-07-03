@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
-"""SAM3D full-body + MANO hand inverse kinematics via ACADOS MPC.
+"""SAM3D body (via COSMIK markers) + MANO hand inverse kinematics, ACADOS MPC.
 
-Takes 70-point Goliath keypoints from SAM3D and solves full-body IK
-(including MANO finger articulation) on human_with_mano.urdf.
+COSMIK-marker variant of run_ik_acados_mpc_sam3d.py.
+
+Instead of solving the body IK directly on the ~16 raw SAM3D Goliath body
+keypoints, this version runs the LSTM augmenter PER FRAME to expand the
+SAM3D body skeleton into the full COSMIK marker set (35 anatomical body
+markers), and solves the body IK on those.  This mirrors the offline
+COSMIK pipeline (run_ik_acados_mpc.py) and is more accurate because each
+URDF segment is constrained by 2-3 markers (medial/lateral pairs, tracking
+clusters) rather than a single joint-center keypoint.
+
+The MANO hands are unchanged: still solved on the 42 raw Goliath hand
+keypoints, since the LSTM augmenter only produces body markers.
+
+Per frame:
+    SAM3D 70 kp -> COSMIK-26 -> LSTM augmenter -> 43 body markers
+                                              (+ 6 head markers from SAM3D)
+                                              (+ 42 hand keypoints from SAM3D)
 
 State:   x = [q; dq]      (nq + nv)
 Control: u = ddq           (nv)
@@ -30,7 +45,7 @@ import pandas as pd
 import pinocchio as pin
 import pinocchio.casadi as cpin
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
-from comfi_examples.urdf_utils import scale_human_model
+from comfi_examples.urdf_utils import scale_human_model, mks_registration
 from comfi_examples.augmenter_utils import augmentTRC, loadModel
 
 
@@ -171,24 +186,50 @@ _TIP_OFFSETS = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SOLVER KEYS  —  which keypoints the MPC actually tracks
+# SOLVER KEYS  —  which markers the MPC actually tracks
 # ═══════════════════════════════════════════════════════════════════════════
+#
+# Body is tracked on COSMIK markers (35) produced by the LSTM augmenter +
+# 6 head markers carried straight from SAM3D.  Hands stay on the 42 raw
+# Goliath hand keypoints (the augmenter does not produce hand markers).
 
+# 6 head markers — taken directly from SAM3D Goliath, mapped to COSMIK names.
+# Value = Goliath index, or a callable for the synthetic "Head" (mid-ears).
+COSMIK_HEAD_FROM_GOLIATH = {
+    "Nose":      0,   # nose
+    "Left_Eye":  1,   # left_eye
+    "Right_Eye": 2,   # right_eye
+    "Left_Ear":  3,   # left_ear
+    "Right_Ear": 4,   # right_ear
+    # "Head" is synthesized as mid-ears below.
+}
+
+# 35 COSMIK body markers tracked by the solver (same set as run_ik_acados_mpc.py
+# KEYS_TO_TRACK).  Head markers + augmenter anatomical markers, NO study/HJC
+# cluster markers (those are used only to register/scale the segments).
 BODY_SOLVER_KEYS = [
-    "left_hip", "right_hip",
-    "left_knee", "right_knee",
-    "left_ankle", "right_ankle",
-    "left_big_toe", "right_big_toe",
-    "left_heel", "right_heel",
-    "left_shoulder", "right_shoulder",
-    "left_elbow", "right_elbow",
-    "nose", "neck",
+    "Nose", "Head", "Right_Ear", "Left_Ear", "Right_Eye", "Left_Eye",
+    "C7", "RASI", "LASI", "RPSI", "LPSI", "RSHO", "RELB", "RMELB",
+    "RWRI", "RMWRI", "RANK", "RMANK", "RTOE", "R5MHD", "RHEE", "RKNE",
+    "RMKNE", "LSHO", "LELB", "LMELB", "LWRI", "LMWRI", "LANK", "LMANK",
+    "LTOE", "L5MHD", "LHEE", "LKNE", "LMKNE",
 ]
 
 HAND_SOLVER_KEYS = GOLIATH_NAMES[21:63]  # all 42 hand keypoints
 
-SOLVER_KEYS = BODY_SOLVER_KEYS + HAND_SOLVER_KEYS  # 58 total
+SOLVER_KEYS = BODY_SOLVER_KEYS + HAND_SOLVER_KEYS  # 77 total
 
+# Study / hip-joint-center cluster markers: produced by the augmenter and used
+# by mks_registration to build segment frames, but NOT tracked by the IK.
+MKS_TO_SKIP = [
+    "r_thigh1_study", "r_thigh2_study", "r_thigh3_study",
+    "L_thigh1_study", "L_thigh2_study", "L_thigh3_study",
+    "r_sh1_study", "r_sh2_study", "r_sh3_study",
+    "L_sh1_study", "L_sh2_study", "L_sh3_study",
+    "RHJC_study", "LHJC_study",
+]
+
+# Wrists stay UNLOCKED (needed for MANO coupling); only thoracic locked.
 JOINTS_TO_LOCK = [
     "middle_thoracic_X", "middle_thoracic_Y", "middle_thoracic_Z",
 ]
@@ -198,22 +239,19 @@ JOINTS_TO_LOCK = [
 # FRAME REGISTRATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def register_tracking_frames(model):
-    """Add OP_FRAME for each Goliath keypoint on its URDF parent link.
+def register_hand_frames(model):
+    """Add OP_FRAME for each Goliath HAND keypoint on its MANO parent link.
 
-    Body keypoints are registered at zero local offset (joint-center
-    approximation).  Fingertip keypoints get a small distal-phalanx
-    tip offset.  All other hand keypoints sit at the MANO link origin.
+    Fingertip keypoints get a small distal-phalanx tip offset; all other
+    hand keypoints sit at the MANO link origin.  Body markers are NOT
+    registered here — they are handled by mks_registration (COSMIK markers).
 
     Returns (model, list_of_registered_names).
     """
     inertia = pin.Inertia.Zero()
-    all_kp_to_link = {}
-    all_kp_to_link.update(GOLIATH_BODY_TO_LINK)
-    all_kp_to_link.update(HAND_KP_TO_MANO_LINK)
 
     registered = []
-    for kp_name, parent_link in all_kp_to_link.items():
+    for kp_name, parent_link in HAND_KP_TO_MANO_LINK.items():
         if not model.existFrame(parent_link):
             print(f"[WARN] Link '{parent_link}' not in URDF, "
                   f"skipping '{kp_name}'")
@@ -564,6 +602,83 @@ def scale_model_from_goliath(
     return human_model
 
 
+def build_cosmik_marker_frames(
+    goliath_data, augmenter_path,
+    subject_height, subject_weight,
+    buffer_size=30,
+):
+    """Run the LSTM augmenter PER FRAME to build COSMIK body marker dicts.
+
+    For each frame t, the augmenter is fed a rolling window of the last
+    `buffer_size` COSMIK-26 frames (front-padded at the start) and returns
+    the 43 COSMIK body markers for frame t — exactly the causal behaviour
+    used live.  Each output frame dict contains:
+        - 43 COSMIK body markers (anatomical + study/HJC clusters)
+        - 6 head markers carried straight from SAM3D (Nose, Head, ears, eyes)
+        - 42 raw Goliath hand keypoints (for the MANO IK)
+
+    NaN input frames are forward-filled with the last valid frame so the
+    augmenter always receives finite data.
+
+    Returns (result_markers, models) where models is the loaded augmenter
+    (kept for reuse / latency reporting).
+    """
+    augmenter_path = str(augmenter_path)
+    models = loadModel(augmenterDir=augmenter_path)
+
+    n_frames = goliath_data.shape[0]
+
+    # Pre-compute COSMIK-26 for every frame, forward-filling NaN frames.
+    cosmik26 = np.zeros((n_frames, 26, 3), dtype=np.float64)
+    last_valid = None
+    for t in range(n_frames):
+        if np.isnan(goliath_data[t]).any():
+            if last_valid is not None:
+                cosmik26[t] = last_valid
+            # else: leave zeros until first valid frame appears
+        else:
+            cosmik26[t] = _goliath_frame_to_cosmik26(goliath_data[t])
+            last_valid = cosmik26[t]
+    # Back-fill any leading all-zero frames with the first valid frame.
+    if last_valid is not None:
+        first_valid_t = next(
+            (t for t in range(n_frames)
+             if not np.isnan(goliath_data[t]).any()), 0)
+        for t in range(first_valid_t):
+            cosmik26[t] = cosmik26[first_valid_t]
+
+    result_markers = []
+    for t in range(n_frames):
+        lo = max(0, t - buffer_size + 1)
+        window = cosmik26[lo:t + 1]
+        if len(window) < buffer_size:  # front-pad with oldest frame
+            pad = np.tile(window[0:1], (buffer_size - len(window), 1, 1))
+            window = np.concatenate([pad, window], axis=0)
+
+        augmented = augmentTRC(
+            window, subject_mass=subject_weight,
+            subject_height=subject_height, models=models,
+            augmenterDir=augmenter_path,
+        )
+
+        frame_dict = {}
+        # 43 augmented COSMIK body markers
+        for i, name in enumerate(_AUGMENTED_MARKER_NAMES):
+            frame_dict[name] = augmented[i * 3: i * 3 + 3]
+        # 6 head markers straight from SAM3D
+        for name, gi in COSMIK_HEAD_FROM_GOLIATH.items():
+            frame_dict[name] = goliath_data[t, gi]
+        frame_dict["Head"] = (
+            goliath_data[t, 3] + goliath_data[t, 4]) / 2.0  # mid ears
+        # 42 raw Goliath hand keypoints for the MANO IK
+        for ki in range(21, 63):
+            frame_dict[GOLIATH_NAMES[ki]] = goliath_data[t, ki]
+
+        result_markers.append(frame_dict)
+
+    return result_markers, models
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════
@@ -574,7 +689,7 @@ _PROJECT_DIR = _SCRIPT_DIR.parent
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="SAM3D full-body + MANO hand IK via ACADOS MPC")
+        description="SAM3D body (via COSMIK markers) + MANO hand IK, ACADOS MPC")
     p.add_argument("--id", dest="subject_id", required=True)
     p.add_argument("--task", required=True)
     p.add_argument("--output-root",
@@ -613,9 +728,9 @@ def parse_args():
     p.add_argument("--save-video", action="store_true")
     p.add_argument("--meshcat-url", default="tcp://127.0.0.1:6000")
     p.add_argument("--output-angles-file",
-                   default="joint_angles_sam3d_mpc.csv")
+                   default="joint_angles_cosmik_mpc.csv")
     p.add_argument("--output-markers-file",
-                   default="markers_model_sam3d_mpc.csv")
+                   default="markers_model_cosmik_mpc.csv")
     return p.parse_args()
 
 
@@ -652,12 +767,19 @@ def main():
     n_frames = goliath_data.shape[0]
     print(f"[INFO] {n_frames} frames, {goliath_data.shape[1]} keypoints")
 
-    result_markers = []
-    for t in range(n_frames):
-        frame_dict = {}
-        for ki, name in enumerate(GOLIATH_NAMES):
-            frame_dict[name] = goliath_data[t, ki]
-        result_markers.append(frame_dict)
+    # ── 1b. Augment SAM3D body -> COSMIK markers (per frame, via LSTM) ────
+    augmenter_path = Path(args.augmenter_path)
+    if not augmenter_path.is_absolute():
+        augmenter_path = _PROJECT_DIR / augmenter_path
+    print(f"[INFO] Running LSTM augmenter per frame "
+          f"(SAM3D body -> {len(_AUGMENTED_MARKER_NAMES)} COSMIK markers)...")
+    result_markers, _augmenter_models = build_cosmik_marker_frames(
+        goliath_data,
+        augmenter_path=augmenter_path,
+        subject_height=args.subject_height,
+        subject_weight=args.subject_weight,
+    )
+    start_dict = result_markers[args.start_sample]
 
     # ── 2. Load URDF ────────────────────────────────────────────────────
     print(f"[INFO] Loading URDF: {urdf_path}")
@@ -669,22 +791,29 @@ def main():
     )
     print(f"[INFO] Raw model: nq={human_model.nq}, nv={human_model.nv}")
 
-    # ── 2b. Scale model to subject dimensions ────────────────────────────
-    augmenter_path = Path(args.augmenter_path)
-    if not augmenter_path.is_absolute():
-        augmenter_path = _PROJECT_DIR / augmenter_path
-    human_model = scale_model_from_goliath(
-        human_model, goliath_data,
-        augmenter_path=augmenter_path,
-        subject_height=args.subject_height,
-        subject_weight=args.subject_weight,
-        gender=args.gender,
-        start_sample=args.start_sample,
-    )
+    # ── 2b. Scale model to subject dimensions (COSMIK markers, start frame) ──
+    try:
+        human_model = scale_human_model(
+            human_model, start_dict,
+            with_hand=False, gender=args.gender,
+            subject_height=args.subject_height,
+        )
+        print(f"[INFO] Body scaled to {args.subject_height}m / "
+              f"{args.subject_weight}kg ({args.gender})")
+    except Exception as e:
+        print(f"[WARN] scale_human_model failed ({e}), using unscaled model")
 
     # ── 3. Register tracking frames ──────────────────────────────────────
-    human_model, registered = register_tracking_frames(human_model)
-    print(f"[INFO] Registered {len(registered)} tracking frames")
+    # Body: COSMIK markers registered on their segments at proper local offsets
+    # (medial/lateral pairs, tracking clusters) via mks_registration.
+    human_model = mks_registration(
+        human_model, start_dict, with_hand=False,
+        gender=args.gender, subject_height=args.subject_height,
+    )
+    # Hands: 42 Goliath hand keypoints on the MANO links.
+    human_model, registered_hand = register_hand_frames(human_model)
+    print(f"[INFO] Registered COSMIK body markers + "
+          f"{len(registered_hand)} hand frames")
 
     # ── 4. Lock thoracic joints (wrists UNLOCKED for MANO coupling) ──────
     joint_ids = [
@@ -765,7 +894,7 @@ def main():
     print("[INFO] IPOPT warm-start (first frame)...")
     from comfi_examples.ik_utils import RT_IK
 
-    warmstart_keys = [k for k in registered if human_model.existFrame(k)]
+    warmstart_keys = [k for k in valid_solver_keys if human_model.existFrame(k)]
     omega = {}
     for k in warmstart_keys:
         omega[k] = 0.5 if k in HAND_KP_TO_MANO_LINK else 1.0
@@ -859,7 +988,7 @@ def main():
     pd.DataFrame(M_model_list).to_csv(output_markers_csv, index=False)
 
     st = np.array(solve_times)
-    output_times_csv = task_dir / "solve_times_sam3d_mpc.csv"
+    output_times_csv = task_dir / "solve_times_cosmik_mpc.csv"
     pd.DataFrame({
         "frame": np.arange(args.start_sample, args.start_sample + len(st)),
         "solve_time_s": st,
@@ -867,7 +996,7 @@ def main():
 
     if video_frames:
         import imageio
-        vpath = task_dir / "ik_sam3d_mpc.mp4"
+        vpath = task_dir / "ik_cosmik_mpc.mp4"
         imageio.mimsave(str(vpath), video_frames, fps=int(1 / args.dt))
         print(f"[INFO] Video saved: {vpath}")
 

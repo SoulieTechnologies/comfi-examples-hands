@@ -2,7 +2,7 @@ from pinocchio.robot_wrapper import RobotWrapper
 import pinocchio as pin
 import numpy as np
 from comfi_examples.linear_algebra_utils import col_vector_3D
-from example_robot_data import load
+# from example_robot_data import load  # unused outside load_robot_panda()
 from comfi_examples.human_model_utils import (
     get_local_mks_positions,
     get_segments_mks_dict,

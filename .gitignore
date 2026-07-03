@@ -25,3 +25,16 @@ Thumbs.db
 data/
 COMFI/
 downloads
+
+# ── build / generated artifacts (rebuilt per machine) ──
+acados/
+c_generated_code/
+*_ocp.json
+main_sam3d_mano_ik_*.c
+model.zip
+output/
+
+# Sharpa robot hand assets (211M — kept local only, not needed for the MANO pipeline)
+model/sharpa_hand/
+model/urdf/human_with_sharpa.urdf
+model/urdf/right_sharpa_wave_*.urdf

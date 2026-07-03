@@ -398,6 +398,7 @@ class AcadosMPCIKSolver:
         W[nmc:nmc + self._nv, nmc:nmc + self._nv] = np.diag(self._w_dq_vec)
         W[nmc + self._nv:, nmc + self._nv:] = self._w_u * np.eye(self._nu)
         ocp.cost.W = W
+        self._W = W   # kept to rebuild per-stage W with NaN markers zeroed out
 
         ocp.cost.yref_e = np.zeros(self._nv)
         ocp.cost.W_e = np.diag(self._w_dq_vec)
@@ -422,6 +423,12 @@ class AcadosMPCIKSolver:
         ocp.solver_options.tol = 1e-3
         ocp.solver_options.globalization = "MERIT_BACKTRACKING"
 
+        # The generated FK/Jacobian C for 58 markers x MANO is a huge straight-line
+        # function; gcc -O2 compiles it pathologically slowly (minutes). -O1 builds
+        # in seconds with negligible runtime cost. (clang on macOS doesn't hit this.)
+        ocp.solver_options.ext_fun_compile_flags = os.environ.get(
+            "ACADOS_EXT_FUN_COMPILE_FLAGS", "-O1")
+
         os.environ["ACADOS_SOURCE_DIR"] = str(
             Path(__file__).resolve().parent.parent / "acados"
         )
@@ -444,16 +451,23 @@ class AcadosMPCIKSolver:
 
         for k in range(self._N):
             p = np.zeros(self._nmc)
+            Wk = self._W.copy()
             for i, key in enumerate(self._valid_keys):
-                if key in marker_window[k]:
-                    p[3 * i:3 * i + 3] = (
-                        np.array(marker_window[k][key]).flatten()[:3]
-                    )
+                val = marker_window[k].get(key, None)
+                if val is not None:
+                    val = np.asarray(val).flatten()[:3]
+                if val is not None and np.all(np.isfinite(val)):
+                    p[3 * i:3 * i + 3] = val
+                else:
+                    # missing / NaN marker (e.g. occluded in one camera view):
+                    # zero its weight this stage so it does not pull the skeleton.
+                    Wk[3 * i:3 * i + 3, 3 * i:3 * i + 3] = 0.0
             yref = np.concatenate(
                 [p, np.zeros(self._nv), np.zeros(self._nu)]
             )
             self._ocp_solver.set(k, "yref", yref)
             self._ocp_solver.set(k, "p", p)
+            self._ocp_solver.cost_set(k, "W", Wk)
 
         self._ocp_solver.set(self._N, "yref", np.zeros(self._nv))
         self._ocp_solver.solve()
@@ -550,6 +564,18 @@ def scale_model_from_goliath(
     mks = {}
     for i, name in enumerate(_AUGMENTED_MARKER_NAMES):
         mks[name] = augmented[i * 3: i * 3 + 3]
+
+    # The augmenter outputs body markers only (no head) → scale_human_model would
+    # fall back to the mocap head branch needing FHD/RHD/LHD (KeyError 'FHD').
+    # Add COSMIK head markers from the same buffer frame as augmentTRC's output
+    # (last frame, same reference frame) so it uses the COSMIK head branch instead.
+    head_src = cosmik_buffer[-1]
+    mks["Nose"]      = head_src[0]
+    mks["Left_Eye"]  = head_src[1]
+    mks["Right_Eye"] = head_src[2]
+    mks["Left_Ear"]  = head_src[3]
+    mks["Right_Ear"] = head_src[4]
+    mks["Head"]      = head_src[17]   # COSMIK 17 = mid-ears
 
     try:
         human_model = scale_human_model(
