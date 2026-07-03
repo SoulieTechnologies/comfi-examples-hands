@@ -64,7 +64,7 @@ def _rx_thread(sock):
             _RX["kp"] = np.frombuffer(msg[4:], dtype=np.float32).reshape(70, 3).copy()
 
 
-def _connect_with_retry(host, port, timeout=120.0):
+def _connect_with_retry(host, port, timeout=900.0):
     """Keep trying to connect until the extractor's emit server is up."""
     t0 = time.time()
     while True:
