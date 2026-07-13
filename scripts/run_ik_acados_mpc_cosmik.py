@@ -279,6 +279,49 @@ def register_hand_frames(model):
 # DATA LOADING
 # ═══════════════════════════════════════════════════════════════════════════
 
+def auto_level(data):
+    """Rotate the whole cloud so the subject's mean up axis (midHip→neck) is +Z.
+
+    The triangulated world frame is cam0's camera frame: ceiling-mounted,
+    rolled or pitched cameras leave the entire cloud rotated. The freeflyer
+    IK absorbs a global rotation, but the LSTM augmenter is NOT
+    rotation-invariant (it only normalizes translation and scale), so a
+    tilted cloud biases the pelvis/spine markers it synthesizes (visible as
+    a bent lower back). The augmenter is yaw-augmented in training, so
+    aligning the up axis is sufficient — this fixes pitch AND roll, unlike
+    --tilt-deg which only handles pitch.
+    """
+    ok = ~np.isnan(data).any(axis=(1, 2))
+    if not ok.any():
+        print("[WARN] auto-level: no valid frame, skipping")
+        return data
+    d = data[ok]
+    midhip = 0.5 * (d[:, 9] + d[:, 10])          # goliath 9/10 = hips
+    up = (d[:, 69] - midhip).mean(axis=0)        # goliath 69 = neck
+    n = np.linalg.norm(up)
+    if n < 1e-6:
+        print("[WARN] auto-level: degenerate up axis, skipping")
+        return data
+    up /= n
+    z = np.array([0.0, 0.0, 1.0])
+    v = np.cross(up, z)
+    c = float(up @ z)
+    s = np.linalg.norm(v)
+    if s < 1e-8:
+        R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    else:
+        vx = np.array([[0, -v[2], v[1]],
+                       [v[2], 0, -v[0]],
+                       [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / s ** 2)
+    ang = np.degrees(np.arccos(np.clip(c, -1.0, 1.0)))
+    print(f"[INFO] auto-level: rotating cloud by {ang:.1f} deg "
+          f"(subject up axis -> +Z)")
+    N, K, _ = data.shape
+    return np.ascontiguousarray(
+        (R @ data.reshape(-1, 3).T).T.reshape(N, K, 3))
+
+
 def load_sam3d_data(path, scale=1.0, cv_to_ros=True, tilt_deg=0.0):
     """Load SAM3D Goliath keypoints -> (N, 70, 3) in metres."""
     path = Path(path)
@@ -716,6 +759,11 @@ def parse_args():
                    help="Skip OpenCV->ROS coordinate conversion")
     p.add_argument("--tilt-deg", type=float, default=0.0,
                    help="Correct camera downward tilt in degrees (e.g. 15 if camera points 15° down)")
+    p.add_argument("--auto-level", action="store_true",
+                   help="Rotate the cloud so the subject's mean midHip->neck axis is +Z. "
+                        "Use when cameras are tilted/rolled (e.g. ceiling mount): the LSTM "
+                        "augmenter is not rotation-invariant and a tilted cloud bends the "
+                        "estimated pelvis/spine. Fixes pitch AND roll (unlike --tilt-deg).")
     p.add_argument("--dt", type=float, default=0.025)
     p.add_argument("--N", type=int, default=3)
     p.add_argument("--subject-height", type=float, default=1.80,
@@ -776,6 +824,8 @@ def main():
         cv_to_ros=not args.no_cv_to_ros,
         tilt_deg=args.tilt_deg,
     )
+    if args.auto_level:
+        goliath_data = auto_level(goliath_data)
     n_frames = goliath_data.shape[0]
     print(f"[INFO] {n_frames} frames, {goliath_data.shape[1]} keypoints")
 
