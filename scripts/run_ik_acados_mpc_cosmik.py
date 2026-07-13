@@ -589,6 +589,18 @@ def scale_model_from_goliath(
     for i, name in enumerate(_AUGMENTED_MARKER_NAMES):
         mks[name] = augmented[i * 3: i * 3 + 3]
 
+    # The augmenter outputs body markers only (no head) → scale_human_model would
+    # fall back to the mocap head branch needing FHD/RHD/LHD (KeyError 'FHD').
+    # Add COSMIK head markers from the same buffer frame as augmentTRC's output
+    # (last frame, same reference frame) so it uses the COSMIK head branch instead.
+    head_src = cosmik_buffer[-1]
+    mks["Nose"]      = head_src[0]
+    mks["Left_Eye"]  = head_src[1]
+    mks["Right_Eye"] = head_src[2]
+    mks["Left_Ear"]  = head_src[3]
+    mks["Right_Ear"] = head_src[4]
+    mks["Head"]      = head_src[17]   # COSMIK 17 = mid-ears
+
     try:
         human_model = scale_human_model(
             human_model, mks,
